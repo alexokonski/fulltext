@@ -2,15 +2,14 @@ use clap;
 
 use std::fs;
 use rust_stemmers;
-use std::collections::HashMap;
-use std::collections::HashSet;
 use std::io::{self, Write};
 use std::time::{self};
 use num_cpus;
 use crossbeam;
-use crossbeam::crossbeam_channel;
+use dashmap;
+use xmlparser;
 
-#[derive(Default, Clone)]
+#[derive(Default)]
 struct Document<'a> {
     title: &'a str,
     url: &'a str,
@@ -19,7 +18,7 @@ struct Document<'a> {
 }
 
 struct Analyzer<'a> {
-    stopwords: HashSet<&'a str>,
+    stopwords: dashmap::DashSet<&'a str>,
     stemmer: rust_stemmers::Stemmer,
 }
 
@@ -39,19 +38,17 @@ impl<'a> Analyzer<'a> {
     }
 }
 
-type InvertedIndex = HashMap<String, HashSet<i32>>;
+type InvertedIndex = dashmap::DashMap<String, dashmap::DashSet<i32>>;
 
 struct SearchResults<'a> {
     term: String,
     matches: Vec<&'a Document<'a>>,
 }
 
-fn append_documents<'a, 'b>(file_contents: &'a str, docs: &'b mut Vec<Document<'a>>, s: &crossbeam::channel::Sender<Vec<Document<'a>>>) {
+fn append_documents<'a, 'b>(file_contents: &'a str, docs: &'b mut Vec<Document<'a>>) {
     let mut cur_doc = Document::default();
     let mut cur_tag: &str = "";
     let mut id = 0;
-    let chunk_size = 1000;
-    let mut chunk: Vec<Document> = Vec::with_capacity(chunk_size);
     for token in xmlparser::Tokenizer::from(file_contents) {
         match token {
             Ok(xmlparser::Token::ElementStart{local, ..}) => {
@@ -73,14 +70,8 @@ fn append_documents<'a, 'b>(file_contents: &'a str, docs: &'b mut Vec<Document<'
                     if n.as_str() == "doc" {
                         cur_doc.id = id;
                         id += 1;
-                        chunk.push(cur_doc.clone());
                         docs.push(cur_doc);
-                    
-                        if chunk.len() == chunk_size {
-                            s.send(chunk).unwrap();
-                            chunk = Vec::with_capacity(chunk_size);
-                        }
-                        cur_doc = Document::default();
+                        cur_doc = Document::default();                        
                     }
                 }
             },
@@ -89,7 +80,6 @@ fn append_documents<'a, 'b>(file_contents: &'a str, docs: &'b mut Vec<Document<'
             Err(_) => {}
         }
     }
-    s.send(chunk).unwrap();
 }
 
 fn search<'a>(docs: &'a Vec<Document>, index: &InvertedIndex, all_terms: Vec<&str>, analyzer: &Analyzer) -> Vec<SearchResults<'a>> {
@@ -98,7 +88,7 @@ fn search<'a>(docs: &'a Vec<Document>, index: &InvertedIndex, all_terms: Vec<&st
         for term in analyzer.analyze(search_term) {
             if let Some(ids) = index.get(&term) {
                 let mut matched_docs: Vec<&Document> = Vec::new();
-                for id in ids {
+                for id in ids.iter() {
                     matched_docs.push(&docs[*id as usize]);
                 }
                 results.push(SearchResults{term: term, matches: matched_docs});
@@ -107,6 +97,50 @@ fn search<'a>(docs: &'a Vec<Document>, index: &InvertedIndex, all_terms: Vec<&st
     }
 
     results
+}
+
+fn index_docs_thread(documents: &[Document], analyzer: &Analyzer, inverted_index: &InvertedIndex) {
+    for d in documents {
+        for token in analyzer.analyze(&d.text) {
+            match inverted_index.get_mut(&token) {
+                Some(set) => {
+                    set.insert(d.id as i32);
+                }, 
+                None => {
+                    let set = dashmap::DashSet::new();
+                    set.insert(d.id as i32);
+                    inverted_index.insert(token, set);
+                }
+            }
+        }
+    }
+}
+
+fn index_all_docs(docs: &Vec<Document>, num_threads: i32, analyzer: &Analyzer) -> InvertedIndex {
+    let inverted_index = InvertedIndex::with_capacity(2_000_000);
+    let num_per_thread = docs.len() / (num_threads as usize);
+    if num_per_thread == 0 {
+        index_docs_thread(docs.as_slice(), analyzer, &inverted_index);
+    } else {
+        crossbeam::thread::scope(|s| {
+            let inverted_index: &InvertedIndex = &inverted_index;
+            let mut offset = 0;
+            for n in 0..num_threads {
+                if offset >= docs.len() {
+                    break;
+                }
+                let mut num_for_thread = num_per_thread;
+                if n == num_threads - 1 {
+                    num_for_thread = docs.len() - offset;
+                }
+                s.spawn(move |_| {
+                    index_docs_thread(&docs[offset..offset+num_for_thread], analyzer, inverted_index);
+                });
+                offset += num_for_thread;
+            }
+        }).unwrap();
+    }
+    inverted_index
 }
 
 macro_rules! print_flush {
@@ -137,11 +171,10 @@ fn main() {
                     .get_matches();
     
     let index_filenames: Vec<&str> = matches.values_of("index").unwrap().collect();
-    let mut documents = Vec::<Document>::with_capacity(2_000_000);
+    let mut documents = Vec::<Document>::new();
     let mut file_contents = Vec::<String>::new();
 
     let before = time::Instant::now();
-
     for filename in index_filenames {
         println!("Reading {}...", filename);
         let file_content: String = fs::read_to_string(filename).unwrap();
@@ -150,67 +183,26 @@ fn main() {
     let duration = time::Instant::now() - before;
     println!("Reading Elapsed: {} ms", duration.as_millis());
 
+    let before = time::Instant::now();
+    for contents in file_contents.iter() {
+        println!("Parsing all files...");
+        append_documents(contents, &mut documents);
+    }
+    let duration = time::Instant::now() - before;
+    println!("Parsing Elapsed: {} ms", duration.as_millis());
+
+    let analyzer: Analyzer = Analyzer::new_english();
     let num_threads = match matches.value_of("threads") {
         Some(t) => t.parse::<i32>().unwrap(),
         None => num_cpus::get() as i32
     };
 
-    println!("Using {} threads to index", num_threads);
-    let before_all = time::Instant::now();
-    let analyzer: Analyzer = Analyzer::new_english();
-    let inverted_index = crossbeam::thread::scope(|s| {
-        let (tx_doc, rx_doc): (crossbeam_channel::Sender<Vec<Document>>, crossbeam_channel::Receiver<Vec<Document>>) = crossbeam_channel::unbounded();
-        let (tx_index, rx_index) = crossbeam_channel::unbounded();
-        for _ in 0..num_threads {
-            let rx_doc = rx_doc.clone();
-            let tx_index = tx_index.clone();
-            let analyzer = &analyzer;
-            s.spawn(move |_| {
-                let mut inverted_index: InvertedIndex = InvertedIndex::with_capacity(500_000);
-                for chunk in rx_doc {
-                    for d in chunk {
-                        for token in analyzer.analyze(&d.text) {
-                            match inverted_index.get_mut(&token) {
-                                Some(set) => {
-                                    set.insert(d.id as i32);
-                                }, 
-                                None => {
-                                    let mut set = HashSet::new();
-                                    set.insert(d.id as i32);
-                                    inverted_index.insert(token, set);
-                                }
-                            }
-                        }
-                    }
-                }
-                tx_index.send(inverted_index).unwrap();
-                drop(tx_index);
-            });
-        }
-        drop(tx_index);
-        for contents in file_contents.iter() {
-            append_documents(contents, &mut documents, &tx_doc);
-        }
-        drop(tx_doc);
-        let mut rx_index_iter = rx_index.into_iter();
-        let mut joined_index = rx_index_iter.next().unwrap();
-        for mut thread_index in rx_index_iter {
-            for (thread_k, thread_set) in thread_index.drain() {
-                match joined_index.get_mut(&thread_k) {
-                    Some(joined_set) => {
-                        joined_set.extend(thread_set);
-                    }, 
-                    None => {
-                        joined_index.insert(thread_k, thread_set);
-                    }                 
-                }
-            }
-        }
-        joined_index
-    }).unwrap();
-
-    let duration_all = time::Instant::now() - before_all;
-    println!("Parsing and indexing elapsed: {} ms, Index size: {}", duration_all.as_millis(), inverted_index.len());
+    println!("Indexing with {} threads...", num_threads);
+    let before = time::Instant::now();
+    //let inverted_index = InvertedIndex::with_capacity(2_000_000);
+    let inverted_index = index_all_docs(&documents, num_threads, &analyzer);
+    let duration = time::Instant::now() - before;
+    println!("Indexing Elapsed: {} ms, Index size: {} terms", duration.as_millis(), inverted_index.len());
 
     if let Some(terms) = matches.values_of("TERM")
     {

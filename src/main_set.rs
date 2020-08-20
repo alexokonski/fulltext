@@ -128,7 +128,6 @@ fn index_all_docs(docs: &Vec<Document>, num_threads: i32, analyzer: &Analyzer) -
     }
 
     crossbeam::thread::scope(|s| {
-        let mut joined_index = InvertedIndex::new();
         let mut offset = 0;
         let (tx, rx) = mpsc::channel();
         for n in 0..num_threads {
@@ -145,8 +144,10 @@ fn index_all_docs(docs: &Vec<Document>, num_threads: i32, analyzer: &Analyzer) -
             });
             offset += num_for_thread;
         }
-        for _ in 0..num_threads {
-            let mut thread_index = rx.recv().unwrap();
+        drop(tx);
+        let mut rx_iter = rx.into_iter();
+        let mut joined_index = rx_iter.next().unwrap();
+        for mut thread_index in rx_iter {
             for (thread_k, thread_set) in thread_index.drain() {
                 match joined_index.get_mut(&thread_k) {
                     Some(joined_set) => {
@@ -203,6 +204,7 @@ fn main() {
     println!("Reading Elapsed: {} ms", duration.as_millis());
 
     let before = time::Instant::now();
+    let before_all = before;
     for contents in file_contents.iter() {
         println!("Parsing all files...");
         append_documents(contents, &mut documents);
@@ -220,7 +222,9 @@ fn main() {
     let before = time::Instant::now();
     let inverted_index = index_all_docs(&documents, num_threads, &analyzer);
     let duration = time::Instant::now() - before;
+    let duration_all = time::Instant::now() - before_all;
     println!("Indexing Elapsed: {} ms, Index size: {} terms", duration.as_millis(), inverted_index.len());
+    println!("Parsing and Indexing Elapsed: {} ms", duration_all.as_millis());
 
     if let Some(terms) = matches.values_of("TERM")
     {
