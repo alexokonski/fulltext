@@ -9,6 +9,12 @@ use std::time::{self};
 use num_cpus;
 use crossbeam;
 use crossbeam::crossbeam_channel;
+use rayon;
+use std::hash::{Hash, Hasher};
+use core::ops::Range;
+use std::sync::atomic::{AtomicI32, Ordering};
+
+static CUR_ID: AtomicI32 = AtomicI32::new(0);
 
 #[derive(Default, Clone)]
 struct Document<'a> {
@@ -16,6 +22,20 @@ struct Document<'a> {
     url: &'a str,
     text: &'a str,
     id: i32
+}
+
+impl<'a> PartialEq for Document<'a> {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl<'a> Eq for Document<'a> {}
+
+impl<'a> Hash for Document<'a> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.id.hash(state);
+    }
 }
 
 struct Analyzer<'a> {
@@ -40,19 +60,27 @@ impl<'a> Analyzer<'a> {
 }
 
 type InvertedIndex = HashMap<String, HashSet<i32>>;
+type DocumentSender<'a> = crossbeam_channel::Sender<Vec<Document<'a>>>;
+type DocumentReceiver<'a> = crossbeam_channel::Receiver<Vec<Document<'a>>>;
+type IndexSender = crossbeam_channel::Sender<InvertedIndex>;
+type IndexReceiver = crossbeam_channel::Receiver<InvertedIndex>;
+type AllDocSender<'a> = crossbeam_channel::Sender<HashMap<i32, Document<'a>>>;
+type AllDocReceiver<'a> = crossbeam_channel::Receiver<HashMap<i32, Document<'a>>>;
+
 
 struct SearchResults<'a> {
     term: String,
     matches: Vec<&'a Document<'a>>,
 }
 
-fn append_documents<'a, 'b>(file_contents: &'a str, docs: &'b mut Vec<Document<'a>>, s: &crossbeam::channel::Sender<Vec<Document<'a>>>) {
+fn parse_task<'a>(contents: &'a str, tx_doc: DocumentSender<'a>, tx_alldocs: AllDocSender<'a>) {
     let mut cur_doc = Document::default();
     let mut cur_tag: &str = "";
-    let mut id = 0;
-    let chunk_size = 1000;
+    let chunk_size = 100;
     let mut chunk: Vec<Document> = Vec::with_capacity(chunk_size);
-    for token in xmlparser::Tokenizer::from(file_contents) {
+    let mut all_docs: HashMap<i32, Document> = HashMap::with_capacity(1_000_000);
+    println!("contents len: {}", contents.len());
+    for token in xmlparser::Tokenizer::from_fragment(contents, Range{start: 0, end: contents.len()}) {
         match token {
             Ok(xmlparser::Token::ElementStart{local, ..}) => {
                 cur_tag = local.as_str();
@@ -71,13 +99,12 @@ fn append_documents<'a, 'b>(file_contents: &'a str, docs: &'b mut Vec<Document<'
                 if let xmlparser::ElementEnd::Close(_, n) = end {
                     cur_tag = "";
                     if n.as_str() == "doc" {
-                        cur_doc.id = id;
-                        id += 1;
+                        cur_doc.id = CUR_ID.fetch_add(1, Ordering::SeqCst);
                         chunk.push(cur_doc.clone());
-                        docs.push(cur_doc);
+                        all_docs.insert(cur_doc.id, cur_doc);
                     
                         if chunk.len() == chunk_size {
-                            s.send(chunk).unwrap();
+                            tx_doc.send(chunk).unwrap();
                             chunk = Vec::with_capacity(chunk_size);
                         }
                         cur_doc = Document::default();
@@ -86,20 +113,70 @@ fn append_documents<'a, 'b>(file_contents: &'a str, docs: &'b mut Vec<Document<'
             },
 
             Ok(_) => {},
-            Err(_) => {}
+            Err(_) => { println!("ERROR!"); }
         }
     }
-    s.send(chunk).unwrap();
+    println!("Parse task complete");
+    tx_doc.send(chunk).unwrap();
+    tx_alldocs.send(all_docs).unwrap();
 }
 
-fn search<'a>(docs: &'a Vec<Document>, index: &InvertedIndex, all_terms: Vec<&str>, analyzer: &Analyzer) -> Vec<SearchResults<'a>> {
+fn parse_documents<'a>(file_contents: &'a Vec<String>, scope: &rayon::Scope<'a>, tx_doc: DocumentSender<'a>) -> AllDocReceiver<'a> {
+    let (tx_alldocs, rx_alldocs): (AllDocSender, AllDocReceiver) = crossbeam_channel::unbounded();
+    for contents in file_contents {
+        let tx_doc = tx_doc.clone();
+        let tx_alldocs = tx_alldocs.clone();
+        scope.spawn(move |_| {
+            //println!("SPAWNED LOL");
+            parse_task(contents, tx_doc, tx_alldocs)
+        });    
+    }
+    rx_alldocs
+}
+
+fn index_task(rx_doc: DocumentReceiver, tx_index: IndexSender, analyzer: &Analyzer) {
+    let mut inverted_index: InvertedIndex = InvertedIndex::with_capacity(500_000);
+    for chunk in rx_doc {
+        for d in chunk {
+            for token in analyzer.analyze(&d.text) {
+                match inverted_index.get_mut(&token) {
+                    Some(set) => {
+                        set.insert(d.id as i32);
+                    }, 
+                    None => {
+                        let mut set = HashSet::new();
+                        set.insert(d.id as i32);
+                        inverted_index.insert(token, set);
+                    }
+                }
+            }
+        }
+    }
+    tx_index.send(inverted_index).unwrap();
+    println!("Indexing finished!");
+}
+
+fn spawn_index_tasks<'a>(num_threads: i32, scope: &rayon::Scope<'a>, analyzer: &'a Analyzer) -> (DocumentSender<'a>, IndexReceiver) {
+    let (tx_doc, rx_doc): (DocumentSender<'a>, DocumentReceiver<'a>) = crossbeam_channel::unbounded();
+    let (tx_index, rx_index) = crossbeam_channel::unbounded();
+    for _ in 0..num_threads {
+        let rx_doc = rx_doc.clone();
+        let tx_index = tx_index.clone();
+        scope.spawn(move |_| {
+            index_task(rx_doc, tx_index, analyzer)
+        });
+    }
+    (tx_doc, rx_index)
+}
+
+fn search<'a>(docs: &'a HashMap<i32, Document>, index: &InvertedIndex, all_terms: Vec<&str>, analyzer: &Analyzer) -> Vec<SearchResults<'a>> {
     let mut results: Vec<SearchResults> = Vec::new();
     for search_term in all_terms {
         for term in analyzer.analyze(search_term) {
             if let Some(ids) = index.get(&term) {
                 let mut matched_docs: Vec<&Document> = Vec::new();
                 for id in ids {
-                    matched_docs.push(&docs[*id as usize]);
+                    matched_docs.push(&docs.get(id).unwrap());
                 }
                 results.push(SearchResults{term: term, matches: matched_docs});
             }
@@ -137,7 +214,6 @@ fn main() {
                     .get_matches();
     
     let index_filenames: Vec<&str> = matches.values_of("index").unwrap().collect();
-    let mut documents = Vec::<Document>::with_capacity(2_000_000);
     let mut file_contents = Vec::<String>::new();
 
     let before = time::Instant::now();
@@ -158,7 +234,51 @@ fn main() {
     println!("Using {} threads to index", num_threads);
     let before_all = time::Instant::now();
     let analyzer: Analyzer = Analyzer::new_english();
-    let inverted_index = crossbeam::thread::scope(|s| {
+
+    /*
+    let (tx_doc, rx_doc): (crossbeam_channel::Sender<Vec<Document>>, crossbeam_channel::Receiver<Vec<Document>>) = crossbeam_channel::unbounded();
+    let (tx_index, rx_index) = crossbeam_channel::unbounded();
+    for _ in 0..num_threads {
+        pool.spawn(|| index_thread(&analyzer, rx_doc.clone(), tx_index.clone()));
+    }
+    println!("AFTER SCOPE!!!!!!!!");
+    drop(tx_index);
+    */
+    let pool = rayon::ThreadPoolBuilder::new().num_threads((num_threads as usize) + file_contents.len() + 1).build().unwrap();
+    let (inverted_index, documents) = pool.scope(|s| {
+        let analyzer = &analyzer;
+        let (tx_doc, rx_index) = spawn_index_tasks(num_threads, s, analyzer);
+        // Async parse documents and push to indexing threads
+        let rx_alldocs = parse_documents(&file_contents, s, tx_doc);
+
+        // Read off indexing threads and merge
+        let mut rx_index_iter = rx_index.into_iter();
+        let mut joined_index = rx_index_iter.next().unwrap();
+        println!("Starting merging...");
+        for mut thread_index in rx_index_iter {
+            for (thread_k, thread_set) in thread_index.drain() {
+                match joined_index.get_mut(&thread_k) {
+                    Some(joined_set) => {
+                        joined_set.extend(thread_set);
+                    }, 
+                    None => {
+                        joined_index.insert(thread_k, thread_set);
+                    }                 
+                }
+            }
+        }
+
+        let mut all_docs_iter = rx_alldocs.into_iter();
+        let mut documents: HashMap<i32, Document> = all_docs_iter.next().unwrap();
+        for mut docs in all_docs_iter {
+            println!("Extending by {}", docs.len());
+            documents.extend(docs.drain());
+        }
+        (joined_index, documents)
+    });
+
+    // Set up threads
+    /*let inverted_index = crossbeam::thread::scope(|s| {
         let (tx_doc, rx_doc): (crossbeam_channel::Sender<Vec<Document>>, crossbeam_channel::Receiver<Vec<Document>>) = crossbeam_channel::unbounded();
         let (tx_index, rx_index) = crossbeam_channel::unbounded();
         for _ in 0..num_threads {
@@ -188,10 +308,14 @@ fn main() {
             });
         }
         drop(tx_index);
+
+        // Parse documents and push to indexing threads
         for contents in file_contents.iter() {
-            append_documents(contents, &mut documents, &tx_doc);
+            parse_documents(contents, &mut documents, &tx_doc);
         }
         drop(tx_doc);
+
+        // Read off indexing threads and merge
         let mut rx_index_iter = rx_index.into_iter();
         let mut joined_index = rx_index_iter.next().unwrap();
         for mut thread_index in rx_index_iter {
@@ -208,9 +332,10 @@ fn main() {
         }
         joined_index
     }).unwrap();
+    */
 
     let duration_all = time::Instant::now() - before_all;
-    println!("Parsing and indexing elapsed: {} ms, Index size: {}", duration_all.as_millis(), inverted_index.len());
+    println!("Parsing and indexing elapsed: {} ms, Index size: {}, Num documents indexed: {}", duration_all.as_millis(), inverted_index.len(), documents.len());
 
     if let Some(terms) = matches.values_of("TERM")
     {
