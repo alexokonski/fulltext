@@ -14,8 +14,7 @@ use std::hash::{Hash, Hasher};
 use core::ops::Range;
 use std::sync::atomic;
 use std::cmp;
-use std::hash::BuildHasherDefault;
-use hashers::fx_hash::FxHasher;
+use dashmap;
 
 static CUR_ID: atomic::AtomicI32 = atomic::AtomicI32::new(0);
 
@@ -74,10 +73,10 @@ impl<'a> Analyzer<'a> {
     }
 }
 
-type InvertedIndex = HashMap<String, HashSet<i32, BuildHasherDefault<FxHasher>>, BuildHasherDefault<FxHasher>>;
+type InvertedIndex = dashmap::DashMap<String, dashmap::DashSet<i32>>;
 type DocumentSender<'a> = crossbeam_channel::Sender<Vec<Document<'a>>>;
 type DocumentReceiver<'a> = crossbeam_channel::Receiver<Vec<Document<'a>>>;
-type IndexSender = crossbeam_channel::Sender<InvertedIndex>;
+//type IndexSender = crossbeam_channel::Sender<InvertedIndex>;
 type IndexReceiver = crossbeam_channel::Receiver<InvertedIndex>;
 
 type DocumentIndex<'a> = Vec<Document<'a>>;
@@ -150,8 +149,8 @@ fn parse_documents<'a>(file_contents: &'a Vec<&str>, scope: &rayon::Scope<'a>, t
     rx_alldocs
 }
 
-fn index_task(rx_doc: DocumentReceiver, tx_index: IndexSender, analyzer: &Analyzer) {
-    let mut inverted_index: InvertedIndex = InvertedIndex::with_capacity_and_hasher(500_000, BuildHasherDefault::<FxHasher>::default());
+fn index_task(rx_doc: DocumentReceiver, inverted_index: &InvertedIndex, analyzer: &Analyzer) {
+    //let mut inverted_index: InvertedIndex = InvertedIndex::with_capacity(500_000);
     for chunk in rx_doc {
         for d in chunk {
             for token in analyzer.analyze(&d.text) {
@@ -160,7 +159,7 @@ fn index_task(rx_doc: DocumentReceiver, tx_index: IndexSender, analyzer: &Analyz
                         set.insert(d.id as i32);
                     }, 
                     None => {
-                        let mut set = HashSet::with_capacity_and_hasher(5, BuildHasherDefault::<FxHasher>::default());
+                        let set = dashmap::DashSet::new();
                         set.insert(d.id as i32);
                         inverted_index.insert(token, set);
                     }
@@ -168,17 +167,16 @@ fn index_task(rx_doc: DocumentReceiver, tx_index: IndexSender, analyzer: &Analyz
             }
         }
     }
-    tx_index.send(inverted_index).unwrap();
+    //tx_index.send(inverted_index).unwrap();
 }
-  
-fn spawn_index_tasks<'a>(num_threads: usize, scope: &rayon::Scope<'a>, analyzer: &'a Analyzer) -> (DocumentSender<'a>, IndexReceiver) {
+
+fn spawn_index_tasks<'a>(num_threads: i32, scope: &rayon::Scope<'a>, inverted_index: &'a InvertedIndex, analyzer: &'a Analyzer) -> (DocumentSender<'a>, IndexReceiver) {
     let (tx_doc, rx_doc): (DocumentSender<'a>, DocumentReceiver<'a>) = crossbeam_channel::unbounded();
     let (tx_index, rx_index) = crossbeam_channel::unbounded();
     for _ in 0..num_threads {
         let rx_doc = rx_doc.clone();
-        let tx_index = tx_index.clone();
         scope.spawn(move |_| {
-            index_task(rx_doc, tx_index, analyzer)
+            index_task(rx_doc, inverted_index, analyzer)
         });
     }
     (tx_doc, rx_index)
@@ -190,7 +188,7 @@ fn search<'a>(docs: &'a DocumentIndex, index: &InvertedIndex, all_terms: Vec<&st
         for term in analyzer.analyze(search_term) {
             if let Some(ids) = index.get(&term) {
                 let mut matched_docs: Vec<&Document> = Vec::new();
-                for id in ids {
+                for id in ids.iter() {
                     matched_docs.push(&docs[*id as usize]);
                 }
                 results.push(SearchResults{term: term, matches: matched_docs});
@@ -213,7 +211,6 @@ fn split_contents<'a>(contents: &'a str, split_on_tag: &str, num_chunks: usize) 
         let try_index = prev_index + chars_per_split;
         if try_index >= contents.len() {
             splits.push(&contents[prev_index..]);
-            println!("sliced from prev_index: {}, to ending_index: {}", prev_index, contents.len());
             break;
         }
         let ending_index;
@@ -249,13 +246,8 @@ fn main() {
                         .takes_value(true)
                         .multiple(true)
                         .required(true))
-                    .arg(clap::Arg::with_name("index_threads")
-                        .long("index_threads")
-                        .value_name("NUM_THREADS")
-                        .number_of_values(1)
-                        .takes_value(true))
-                    .arg(clap::Arg::with_name("parse_threads")
-                        .long("parse_threads")
+                    .arg(clap::Arg::with_name("threads")
+                        .long("threads")
                         .value_name("NUM_THREADS")
                         .number_of_values(1)
                         .takes_value(true))
@@ -269,16 +261,6 @@ fn main() {
     let mut contents_split = Vec::<&str>::new();
     let before = time::Instant::now();
 
-    let num_index_threads = match matches.value_of("index_threads") {
-        Some(t) => t.parse::<usize>().unwrap(),
-        None => num_cpus::get()
-    };
-
-    let num_parse_threads = match matches.value_of("parse_threads") {
-        Some(t) => t.parse::<usize>().unwrap(),
-        None => 2
-    };
-
     for filename in index_filenames {
         println!("Reading {}...", filename);
         let file_content: String = fs::read_to_string(filename).unwrap();
@@ -286,7 +268,7 @@ fn main() {
     }
 
     for raw_content in &file_contents {
-        for contents in split_contents(&raw_content, "</doc>", num_parse_threads) {
+        for contents in split_contents(&raw_content, "</doc>", 8) {
             contents_split.push(contents);
         }
     }
@@ -296,9 +278,12 @@ fn main() {
     let duration = time::Instant::now() - before;
     println!("Reading Elapsed: {} ms", duration.as_millis());
 
+    let num_threads = match matches.value_of("threads") {
+        Some(t) => t.parse::<i32>().unwrap(),
+        None => num_cpus::get() as i32
+    };
 
-
-    println!("Using {} threads to index, {} threads to parse", num_index_threads, num_parse_threads);
+    println!("Using {} threads to index", num_threads);
     let before_all = time::Instant::now();
     let analyzer: Analyzer = Analyzer::new_english();
 
@@ -311,15 +296,16 @@ fn main() {
     println!("AFTER SCOPE!!!!!!!!");
     drop(tx_index);
     */
-    let pool = rayon::ThreadPoolBuilder::new().num_threads(num_index_threads + num_parse_threads + 1).build().unwrap();
-    let (inverted_index, mut documents) = pool.scope(|s| {
+    let pool = rayon::ThreadPoolBuilder::new().num_threads((num_threads as usize) + contents_split.len() + 1).build().unwrap();
+    let inverted_index: InvertedIndex = InvertedIndex::with_capacity(2_000_000);
+    let mut documents = pool.scope(|s| {
         let analyzer = &analyzer;
-        let (tx_doc, rx_index) = spawn_index_tasks(num_index_threads, s, analyzer);
+        let (tx_doc, _) = spawn_index_tasks(num_threads, s, &inverted_index, analyzer);
         // Async parse documents and push to indexing threads
         let rx_alldocs = parse_documents(&contents_split, s, tx_doc);
 
         // Read off indexing threads and merge
-        let mut rx_index_iter = rx_index.into_iter();
+        /*let mut rx_index_iter = rx_index.into_iter();
         let mut joined_index = rx_index_iter.next().unwrap();
         println!("Starting merging...");
         for mut thread_index in rx_index_iter {
@@ -333,14 +319,14 @@ fn main() {
                     }                 
                 }
             }
-        }
+        }*/
 
         let mut all_docs_iter = rx_alldocs.into_iter();
         let mut documents: DocumentIndex = all_docs_iter.next().unwrap();
         for docs in all_docs_iter {
             documents.extend(docs);
         }
-        (joined_index, documents)
+        documents
     });
 
     // Set up threads
