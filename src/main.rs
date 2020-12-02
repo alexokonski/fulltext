@@ -113,5 +113,4 @@ fn main() {
             }
         }
     }
-    drop(word_index);
 }
