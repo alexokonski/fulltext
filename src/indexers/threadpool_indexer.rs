@@ -22,7 +22,9 @@ pub struct ThreadPoolIndexer<'a> {
     documents: DocumentIndex<'a>,
     analyzer: Analyzer,
     cur_id: atomic::AtomicI32,
-    pool: rayon::ThreadPool
+    pool: rayon::ThreadPool,
+    parse_threads: usize,
+    index_threads: usize
 }
 
 fn parse_task<'a>(contents: &'a str, tx_doc: DocumentSender<'a>, tx_alldocs: AllDocSender<'a>, cur_id: &atomic::AtomicI32) {
@@ -136,7 +138,9 @@ impl<'a> ThreadPoolIndexer<'a> {
             documents: DocumentIndex::new(), 
             analyzer: Analyzer::new_english(),
             cur_id: atomic::AtomicI32::new(0),
-            pool: rayon::ThreadPoolBuilder::new().num_threads(parse_threads + index_threads + 1).build().unwrap()
+            pool: rayon::ThreadPoolBuilder::new().num_threads(parse_threads + index_threads + 1).build().unwrap(),
+            parse_threads: parse_threads,
+            index_threads: index_threads
         }
     }
 }
@@ -148,7 +152,7 @@ impl<'a> DocumentIndexer<'a> for ThreadPoolIndexer<'a> {
         //let num_threads = num_cpus::get();
         println!("NUM CPUS: {}", num_cpus::get());
         for raw_content in &self.file_contents {
-            for contents in split_contents(&raw_content, "</doc>", 6) {
+            for contents in split_contents(&raw_content, "</doc>", self.parse_threads) {
                 contents_split.push(contents);
             }
         }
@@ -157,7 +161,7 @@ impl<'a> DocumentIndexer<'a> for ThreadPoolIndexer<'a> {
         let analyzer = &self.analyzer;
         let cur_id = &self.cur_id;
         let (inverted_index, documents) = pool.scope(|s| {
-            let (tx_doc, rx_index) = spawn_index_tasks(10, s, &analyzer);
+            let (tx_doc, rx_index) = spawn_index_tasks(self.index_threads, s, &analyzer);
             // Async parse documents and push to indexing threads
             let rx_alldocs = parse_documents(contents_split, &cur_id, s, tx_doc);
     

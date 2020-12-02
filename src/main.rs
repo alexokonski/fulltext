@@ -54,7 +54,6 @@ fn main() {
         None => 6
     };
 
-
     let before_all = time::Instant::now();
     let index_filenames: Vec<&str> = matches.values_of("index").unwrap().collect();
     let mut file_contents = Vec::<String>::new();
