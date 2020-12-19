@@ -30,7 +30,6 @@ fn index_docs_index_only<'a>(documents: &[Document<'a>], analyzer: &Analyzer) ->
 }
 
 pub struct RayonIndexer<'a> { 
-    file_contents: Vec<&'a str>,
     index: InvertedIndex, 
     documents: DocumentIndex<'a>,
     analyzer: Analyzer,
@@ -40,7 +39,6 @@ pub struct RayonIndexer<'a> {
 impl<'a> RayonIndexer<'a> {
     pub fn new() -> Self {
         RayonIndexer { 
-            file_contents: Vec::new(),
             index: InvertedIndex::with_capacity_and_hasher(2_000_000, BuildHasherDefault::<FxHasher>::default()), 
             documents: DocumentIndex::new(), 
             analyzer: Analyzer::new_english(),
@@ -88,21 +86,12 @@ impl<'a> RayonIndexer<'a> {
     }
 }
 
-impl<'a> From<Vec<&'a str>> for RayonIndexer<'a> {
-    fn from(file_contents: Vec<&'a str>) -> Self {
-        let mut indexer = RayonIndexer::new();
-        indexer.build_index(file_contents);
-        indexer
-    }
-}
-
 impl<'a> DocumentIndexer<'a> for RayonIndexer<'a> {
 
-    fn build_index(&mut self, file_contents: Vec<&'a str>) {
-        self.file_contents = file_contents;
+    fn build_index(&mut self, file_contents: &Vec<&'a str>) {
         let mut contents_split: Vec<&str> = Vec::new();
         let num_threads = num_cpus::get();
-        for raw_content in &self.file_contents {
+        for raw_content in file_contents {
             for contents in split_contents(&raw_content, "</doc>", num_threads) {
                 contents_split.push(contents);
             }

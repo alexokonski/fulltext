@@ -5,20 +5,26 @@ use std::sync::atomic;
 use core::ops::Range;
 use crossbeam;
 use crossbeam::crossbeam_channel;
+use dashmap;
 
-pub type InvertedIndex = HashMap<String, HashSet<i32, BuildHasherDefault<FxHasher>>, BuildHasherDefault<FxHasher>>;
+pub type HashMapInvertedIndex = HashMap<String, HashSet<i32, BuildHasherDefault<FxHasher>>, BuildHasherDefault<FxHasher>>;
+pub type DashMapInvertedIndex = dashmap::DashMap<String, dashmap::DashSet<i32>>;
 pub type DocumentIndex<'a> = Vec<Document<'a>>;
 
 type DocumentSender<'a> = crossbeam_channel::Sender<Vec<Document<'a>>>;
 type DocumentReceiver<'a> = crossbeam_channel::Receiver<Vec<Document<'a>>>;
-type IndexSender = crossbeam_channel::Sender<InvertedIndex>;
-type IndexReceiver = crossbeam_channel::Receiver<InvertedIndex>;
+type IndexSender = crossbeam_channel::Sender<HashMapInvertedIndex>;
+type IndexReceiver = crossbeam_channel::Receiver<HashMapInvertedIndex>;
 type AllDocSender<'a> = crossbeam_channel::Sender<DocumentIndex<'a>>;
 type AllDocReceiver<'a> = crossbeam_channel::Receiver<DocumentIndex<'a>>;
 
-pub struct ThreadPoolIndexer<'a> { 
-    file_contents: Vec<&'a str>,
-    index: InvertedIndex, 
+enum IndexType {
+    SingleThread(HashMapInvertedIndex),
+    MultiThread(DashMapInvertedIndex)
+}
+
+pub struct ThreadPoolIndexer<'a> {
+    index: IndexType, 
     documents: DocumentIndex<'a>,
     analyzer: Analyzer,
     cur_id: atomic::AtomicI32,
@@ -87,8 +93,8 @@ fn parse_documents<'b, 'a: 'b>(file_contents: Vec<&'a str>, cur_id: &'b atomic::
     rx_alldocs
 }
 
-fn index_task<'b>(rx_doc: DocumentReceiver, tx_index: IndexSender, analyzer: &'b Analyzer) {
-    let mut inverted_index: InvertedIndex = InvertedIndex::with_capacity_and_hasher(500_000, BuildHasherDefault::<FxHasher>::default());
+fn index_task(rx_doc: DocumentReceiver, tx_index: IndexSender, analyzer: &Analyzer) {
+    let mut inverted_index: HashMapInvertedIndex = HashMapInvertedIndex::with_capacity_and_hasher(500_000, BuildHasherDefault::<FxHasher>::default());
     for chunk in rx_doc {
         for d in chunk {
             for token in analyzer.analyze(&d.text) {
@@ -97,7 +103,7 @@ fn index_task<'b>(rx_doc: DocumentReceiver, tx_index: IndexSender, analyzer: &'b
                         set.insert(d.id as i32);
                     }, 
                     None => {
-                        let mut set = HashSet::with_capacity_and_hasher(5, BuildHasherDefault::<FxHasher>::default());
+                        let mut set = HashSet::with_hasher(BuildHasherDefault::<FxHasher>::default());
                         set.insert(d.id as i32);
                         inverted_index.insert(token, set);
                     }
@@ -106,6 +112,25 @@ fn index_task<'b>(rx_doc: DocumentReceiver, tx_index: IndexSender, analyzer: &'b
         }
     }
     tx_index.send(inverted_index).unwrap();
+}
+
+fn dashmap_index_task(rx_doc: DocumentReceiver, inverted_index: &DashMapInvertedIndex, analyzer: &Analyzer) {
+    for chunk in rx_doc {
+        for d in chunk {
+            for token in analyzer.analyze(&d.text) {
+                match inverted_index.get_mut(&token) {
+                    Some(set) => {
+                        set.insert(d.id as i32);
+                    }, 
+                    None => {
+                        let set = dashmap::DashSet::new();
+                        set.insert(d.id as i32);
+                        inverted_index.insert(token, set);
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn spawn_index_tasks<'b, 'a: 'b>(num_threads: usize, scope: &rayon::Scope<'b>, analyzer: &'b Analyzer) -> (DocumentSender<'a>, IndexReceiver) {
@@ -121,20 +146,22 @@ fn spawn_index_tasks<'b, 'a: 'b>(num_threads: usize, scope: &rayon::Scope<'b>, a
     (tx_doc, rx_index)
 }
 
-impl<'a> From<Vec<&'a str>> for ThreadPoolIndexer<'a> {
-    fn from(file_contents: Vec<&'a str>) -> Self {
-        let default_threads = num_cpus::get() / 2;
-        let mut indexer = ThreadPoolIndexer::new(default_threads, default_threads);
-        indexer.build_index(file_contents);
-        indexer
+fn spawn_dashmap_index_tasks<'b, 'a: 'b>(num_threads: usize, inverted_index: &'b DashMapInvertedIndex, scope: &rayon::Scope<'b>, analyzer: &'b Analyzer) -> DocumentSender<'a> {
+    let (tx_doc, rx_doc): (DocumentSender<'a>, DocumentReceiver<'a>) = crossbeam_channel::unbounded();
+    for _ in 0..num_threads {
+        let rx_doc = rx_doc.clone();
+        scope.spawn(move |_| {
+            dashmap_index_task(rx_doc, inverted_index, analyzer);
+        });
     }
+
+    tx_doc
 }
 
 impl<'a> ThreadPoolIndexer<'a> {
-    pub fn new(parse_threads: usize, index_threads: usize) -> Self {
+    pub fn new_hashmap(parse_threads: usize, index_threads: usize) -> Self {
         ThreadPoolIndexer { 
-            file_contents: Vec::new(),
-            index: InvertedIndex::with_capacity_and_hasher(2_000_000, BuildHasherDefault::<FxHasher>::default()), 
+            index: IndexType::SingleThread(HashMapInvertedIndex::with_hasher(BuildHasherDefault::<FxHasher>::default())), 
             documents: DocumentIndex::new(), 
             analyzer: Analyzer::new_english(),
             cur_id: atomic::AtomicI32::new(0),
@@ -143,25 +170,26 @@ impl<'a> ThreadPoolIndexer<'a> {
             index_threads: index_threads
         }
     }
-}
-
-impl<'a> DocumentIndexer<'a> for ThreadPoolIndexer<'a> {  
-    fn build_index(&mut self, file_contents: Vec<&'a str>) {
-        self.file_contents = file_contents;
-        let mut contents_split: Vec<&str> = Vec::new();
-        //let num_threads = num_cpus::get();
-        println!("NUM CPUS: {}", num_cpus::get());
-        for raw_content in &self.file_contents {
-            for contents in split_contents(&raw_content, "</doc>", self.parse_threads) {
-                contents_split.push(contents);
-            }
+    
+    pub fn new_dashmap(parse_threads: usize, index_threads: usize) -> Self {
+        ThreadPoolIndexer { 
+            index: IndexType::MultiThread(DashMapInvertedIndex::new()), 
+            documents: DocumentIndex::new(), 
+            analyzer: Analyzer::new_english(),
+            cur_id: atomic::AtomicI32::new(0),
+            pool: rayon::ThreadPoolBuilder::new().num_threads(parse_threads + index_threads + 1).build().unwrap(),
+            parse_threads: parse_threads,
+            index_threads: index_threads
         }
+    }
 
+    fn build_hashmap(&self, contents_split: Vec<&'a str>) -> (HashMapInvertedIndex, DocumentIndex<'a>) {
         let pool = &self.pool;
         let analyzer = &self.analyzer;
         let cur_id = &self.cur_id;
         let (inverted_index, documents) = pool.scope(|s| {
             let (tx_doc, rx_index) = spawn_index_tasks(self.index_threads, s, &analyzer);
+
             // Async parse documents and push to indexing threads
             let rx_alldocs = parse_documents(contents_split, &cur_id, s, tx_doc);
     
@@ -188,28 +216,86 @@ impl<'a> DocumentIndexer<'a> for ThreadPoolIndexer<'a> {
             }
             (joined_index, documents)
         });
-        self.index = inverted_index;
-        self.documents = documents;
+
+        (inverted_index, documents)
+    }
+
+    fn build_dashmap(&self, contents_split: Vec<&'a str>) -> (DashMapInvertedIndex, DocumentIndex<'a>) {
+        let pool = &self.pool;
+        let analyzer = &self.analyzer;
+        let cur_id = &self.cur_id;
+        let inverted_index = DashMapInvertedIndex::with_capacity(2_000_000);
+        let documents = pool.scope(|s| {
+            let tx_doc = spawn_dashmap_index_tasks(self.index_threads, &inverted_index, s, &analyzer);
+
+            // Async parse documents and push to indexing threads
+            let rx_alldocs = parse_documents(contents_split, &cur_id, s, tx_doc);
+    
+            let mut all_docs_iter = rx_alldocs.into_iter();
+            let mut documents: DocumentIndex = all_docs_iter.next().unwrap();
+            for docs in all_docs_iter {
+                documents.extend(docs);
+            }
+            documents
+        });
+
+        (inverted_index, documents)
+    }
+}
+
+macro_rules! search {
+    ($s:expr, $idx:expr, $all_terms:expr ,$results:expr) => {
+        for search_term in $all_terms {
+            for term in $s.analyzer.analyze(search_term) {
+                if let Some(ids) = $idx.get(&term) {
+                    let mut matched_docs: Vec<&Document> = Vec::new();
+                    for id in ids.iter() {
+                        matched_docs.push(&$s.documents[*id as usize]);
+                    }
+                    $results.push(SearchResults{term: term, matches: matched_docs});
+                }
+            }
+        }
+    };
+}
+
+impl<'a> DocumentIndexer<'a> for ThreadPoolIndexer<'a> {  
+    fn build_index(&mut self, file_contents: &Vec<&'a str>) {
+        //self.file_contents = file_contents;
+        let mut contents_split: Vec<&str> = Vec::new();
+        //let num_threads = num_cpus::get();
+        println!("NUM CPUS: {}", num_cpus::get());
+        for raw_content in file_contents {
+            for contents in split_contents(&raw_content, "</doc>", self.parse_threads) {
+                contents_split.push(contents);
+            }
+        }
+
+        if let IndexType::SingleThread(_) = self.index {
+            let (index, documents) = self.build_hashmap(contents_split);
+            self.index = IndexType::SingleThread(index);
+            self.documents = documents;
+        } else {
+            let (index, documents) = self.build_dashmap(contents_split);
+            self.index = IndexType::MultiThread(index);
+            self.documents = documents;
+        }
     }
     
     fn search(&self, all_terms: Vec<&str>) -> Vec<SearchResults> {
         let mut results: Vec<SearchResults> = Vec::new();
-        for search_term in all_terms {
-            for term in self.analyzer.analyze(search_term) {
-                if let Some(ids) = self.index.get(&term) {
-                    let mut matched_docs: Vec<&Document> = Vec::new();
-                    for id in ids {
-                        matched_docs.push(&self.documents[*id as usize]);
-                    }
-                    results.push(SearchResults{term: term, matches: matched_docs});
-                }
-            }
+        match &self.index {
+            IndexType::SingleThread(idx) => search!(self, idx, all_terms, results),
+            IndexType::MultiThread(idx) => search!(self, idx, all_terms, results)
         }
-    
         results
     }
+
     fn num_tokens(&self) -> usize {
-        self.index.len()
+        match &self.index {
+            IndexType::SingleThread(idx) => idx.len(),
+            IndexType::MultiThread(idx) => idx.len()
+        }
     }
     fn num_documents(&self) -> usize {
         self.documents.len()

@@ -41,7 +41,7 @@ pub struct SearchResults<'a> {
 }
 
 pub trait DocumentIndexer<'a> {
-    fn build_index(&mut self, file_contents: Vec<&'a str>);
+    fn build_index(&mut self, file_contents: &Vec<&'a str>);
     fn search(&self, all_terms: Vec<&str>) -> Vec<SearchResults>;
     fn num_tokens(&self) -> usize;
     fn num_documents(&self) -> usize;

@@ -37,7 +37,7 @@ fn main() {
                         .value_name("BACKEND")
                         .number_of_values(1)
                         .default_value("rayon")
-                        .possible_values(&["rayon", "threadpool"])
+                        .possible_values(&["rayon", "threadpool", "threadpool_dashmap"])
                         .takes_value(true))
                     .arg(clap::Arg::with_name("TERM")
                         .required(false)
@@ -54,6 +54,8 @@ fn main() {
         None => 6
     };
 
+    let backend = matches.value_of("backend").unwrap();
+
     let before_all = time::Instant::now();
     let index_filenames: Vec<&str> = matches.values_of("index").unwrap().collect();
     let mut file_contents = Vec::<String>::new();
@@ -66,16 +68,16 @@ fn main() {
     println!("Reading done. Elapsed: {} ms", duration_read.as_millis());
 
     let before_parse = time::Instant::now();
-    let ref_contents: Vec<&str> = file_contents.iter().map(|s| s as &str).collect();
-    let backend = matches.value_of("backend").unwrap();
     let mut word_index: Box<dyn DocumentIndexer> = match backend {
         "rayon" => Box::new(RayonIndexer::new()),
-        "threadpool" => Box::new(ThreadPoolIndexer::new(num_parse_threads, num_index_threads)),
+        "threadpool" => Box::new(ThreadPoolIndexer::new_hashmap(num_parse_threads, num_index_threads)),
+        "threadpool_dashmap" => Box::new(ThreadPoolIndexer::new_dashmap(num_parse_threads, num_index_threads)),
         _ => panic!("unknown backend")
     };
 
     println!("Building index using '{}' backend...", backend);
-    word_index.build_index(ref_contents);
+    let ref_contents: Vec<&str> = file_contents.iter().map(|s| s as &str).collect();
+    word_index.build_index(&ref_contents);
     let now = time::Instant::now();
     let duration_parse = now - before_parse;
     let duration_all = now - before_all;
