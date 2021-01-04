@@ -178,16 +178,30 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cd56b59865bce947ac5958779cfa508f6c3b9497cc762b7e24a12d11ccde2c4f"
 
 [[package]]
+name = "flatbuffers"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f4d0e80bffea40f65eb6eefd74f2bef75d3c4f5dfdf973b91449706d43369cd9"
+dependencies = [
+ "bitflags",
+ "smallvec",
+ "thiserror",
+]
+
+[[package]]
 name = "fulltext"
 version = "0.1.0"
 dependencies = [
  "clap",
  "crossbeam",
  "dashmap",
+ "flatbuffers",
  "hashers",
+ "memmap",
  "num_cpus",
  "rayon",
  "rust-stemmers",
+ "serde",
  "xmlparser",
 ]
 
@@ -248,6 +262,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "60302e4db3a61da70c0cb7991976248362f30319e88850c487b9b95bbf059e00"
 
 [[package]]
+name = "memmap"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6585fd95e7bb50d6cc31e20d4cf9afb4e2ba16c5846fc76793f11218da9c475b"
+dependencies = [
+ "libc",
+ "winapi",
+]
+
+[[package]]
 name = "memoffset"
 version = "0.5.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -274,9 +298,9 @@ checksum = "99c605b9a0adc77b7211c6b1f722dcb613d68d66859a44f3d485a6da332b0598"
 
 [[package]]
 name = "proc-macro2"
-version = "1.0.19"
+version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "04f5f085b5d71e2188cb8271e5da0161ad52c3f227a661a3c135fdf28e258b12"
+checksum = "1e0704ee1a7e00d7bb417d0770ea303c1bccbabf0ef1667dae92b5967f5f8a71"
 dependencies = [
  "unicode-xid",
 ]
@@ -333,9 +357,9 @@ checksum = "d29ab0c6d3fc0ee92fe66e2d99f700eab17a8d57d1c1d3b748380fb20baa78cd"
 
 [[package]]
 name = "serde"
-version = "1.0.114"
+version = "1.0.118"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5317f7588f0a5078ee60ef675ef96735a1442132dc645eb1d12c018620ed8cd3"
+checksum = "06c64263859d87aa2eb554587e2d23183398d617427327cf2b3d0ed8c69e4800"
 
 [[package]]
 name = "serde_derive"
@@ -349,6 +373,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "smallvec"
+version = "1.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ae524f056d7d770e174287294f562e95044c68e88dec909a00d2094805db9d75"
+
+[[package]]
 name = "strsim"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -356,9 +386,9 @@ checksum = "8ea5119cdb4c55b55d432abb513a0429384878c15dde60cc77b1c99de1a95a6a"
 
 [[package]]
 name = "syn"
-version = "1.0.36"
+version = "1.0.56"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4cdb98bcb1f9d81d07b536179c269ea15999b5d14ea958196413869445bb5250"
+checksum = "a9802ddde94170d186eeee5005b798d9c159fa970403f1be19976d0cfb939b72"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -372,6 +402,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d326610f408c7a4eb6f51c37c330e496b08506c9457c9d34287ecc38809fb060"
 dependencies = [
  "unicode-width",
+]
+
+[[package]]
+name = "thiserror"
+version = "1.0.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "76cc616c6abf8c8928e2fdcc0dbfab37175edd8fb49a4641066ad1364fdab146"
+dependencies = [
+ "thiserror-impl",
+]
+
+[[package]]
+name = "thiserror-impl"
+version = "1.0.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9be73a2caec27583d0046ef3796c3794f868a5bc813db689eed00c7631275cd1"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]

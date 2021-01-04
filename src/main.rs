@@ -58,11 +58,11 @@ fn main() {
 
     let before_all = time::Instant::now();
     let index_filenames: Vec<&str> = matches.values_of("index").unwrap().collect();
-    let mut file_contents = Vec::<String>::new();
+    let mut file_contents = String::new();
     for filename in index_filenames {
         println!("Reading {}...", filename);
         let file_content: String = fs::read_to_string(filename).unwrap();
-        file_contents.push(file_content);
+        file_contents.push_str(&file_content);
     }
     let duration_read = time::Instant::now() - before_all;
     println!("Reading done. Elapsed: {} ms", duration_read.as_millis());
@@ -76,8 +76,7 @@ fn main() {
     };
 
     println!("Building index using '{}' backend...", backend);
-    let ref_contents: Vec<&str> = file_contents.iter().map(|s| s as &str).collect();
-    word_index.build_index(&ref_contents);
+    word_index.build_from_file_contents(file_contents);
     let now = time::Instant::now();
     let duration_parse = now - before_parse;
     let duration_all = now - before_all;
@@ -106,7 +105,7 @@ fn main() {
                     println!("Search found {} results, completed in {} us", results.iter().map(|m| m.matches.len()).sum::<usize>(), duration.as_micros());
                     for result in results {
                         for doc in result.matches {
-                            println!("Found \"{}\" in {} {}", result.term, doc.title, doc.url);
+                            println!("Found \"{}\" in {} {} {} {}", result.term, doc.id, doc.title, doc.url, doc.text);
                         }
                     }              
                 }
