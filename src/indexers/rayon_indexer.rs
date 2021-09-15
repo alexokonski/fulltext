@@ -4,6 +4,10 @@ use hashers::fx_hash::FxHasher;
 use std::sync::atomic;
 use core::ops::Range;
 use rayon::prelude::*;
+//use flexbuffers;
+use bincode;
+//use rmp_serde;
+use std::time::{self};
 
 pub type InvertedIndex = HashMapInvertedIndex;
 pub type DocumentIndex = Vec<DocumentRaw>;
@@ -126,6 +130,39 @@ impl DocumentIndexer for RayonIndexer {
             );
         self.full_contents = Box::new(file_contents);
     }
+    fn build_from_serialized(&mut self, serialized_data: SerializedIndex) {
+        let before = time::Instant::now();
+        //let r = flexbuffers::Reader::get_root((*serialized_data.inverted_index).as_ref()).unwrap();
+        //self.index = HashMapInvertedIndex::deserialize(r).unwrap();
+        self.index = bincode::deserialize((*serialized_data.inverted_index).as_ref()).unwrap();
+        //self.index = rmp_serde::from_read_ref((*serialized_data.inverted_index).as_ref()).unwrap();
+        let after = time::Instant::now(); let total = after - before;
+        println!("Index deserialize elapsed: {}", total.as_millis());
+        let before = time::Instant::now();
+        //let r = flexbuffers::Reader::get_root((*serialized_data.documents).as_ref()).unwrap();
+        //self.documents = DocumentIndex::deserialize(r).unwrap();
+        self.documents = bincode::deserialize((*serialized_data.documents).as_ref()).unwrap();
+        //self.documents = rmp_serde::from_read_ref((*serialized_data.documents).as_ref()).unwrap();
+        let after = time::Instant::now(); let total = after - before;
+        println!("Documents deserialize elapsed: {}", total.as_millis());
+
+        self.full_contents = serialized_data.file_contents;
+    }
+    fn get_serialized_inverted_index(&self) -> Vec<u8> {
+        //let mut s = flexbuffers::FlexbufferSerializer::new();
+        //self.index.serialize(&mut s).unwrap();
+        //s.take_buffer()
+        bincode::serialize(&self.index).unwrap()
+        //rmp_serde::to_vec(&self.index).unwrap()
+    }
+    fn get_serialized_documents(&self) -> Vec<u8> {
+        //let mut s = flexbuffers::FlexbufferSerializer::new();
+        //self.documents.serialize(&mut s).unwrap();
+        //s.take_buffer()
+        bincode::serialize(&self.documents).unwrap()
+        //rmp_serde::to_vec(&self.documents).unwrap()
+    }
+
     fn search(&self, all_terms: Vec<&str>) -> Vec<SearchResults> {
         let mut results: Vec<SearchResults> = Vec::new();
         for search_term in all_terms {

@@ -5,14 +5,27 @@ use hashers::fx_hash::FxHasher;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::Path;
+use std::io::prelude::*;
 use std::fs::File;
 use std::io;
 use memmap;
 use std::ops::Range;
 use std::cmp;
+use serde::{Serialize, Deserialize};
+use std::fs;
 
 pub use rayon_indexer::RayonIndexer;
 pub use threadpool_indexer::ThreadPoolIndexer;
+
+trait SomeBytes: AsRef<[u8]> + Sync {
+    fn from_utf8_unchecked(&self, range: Range<usize>) -> &str {
+        unsafe { std::str::from_utf8_unchecked(&self.as_ref()[range]) }
+    }
+}
+
+impl SomeBytes for memmap::Mmap {}
+impl SomeBytes for String {}
+impl SomeBytes for Vec<u8> {}
 
 type HashMapInvertedIndex = HashMap<String, HashSet<i32, BuildHasherDefault<FxHasher>>, BuildHasherDefault<FxHasher>>;
 
@@ -65,7 +78,7 @@ impl Ord for Document {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct DocumentRaw {
     pub title: Range<usize>,
     pub url: Range<usize>,
@@ -74,11 +87,11 @@ pub struct DocumentRaw {
 }
 
 impl DocumentRaw {
-    fn to_document(&self, full_document: &(dyn AsRef<[u8]> + Sync)) -> Document {
+    fn to_document(&self, full_document: &dyn SomeBytes) -> Document {
         Document {
-            title: String::from(std::str::from_utf8(&(*full_document).as_ref()[self.title.clone()]).unwrap()),
-            url: String::from(std::str::from_utf8(&(*full_document).as_ref()[self.url.clone()]).unwrap()),
-            text: String::from(std::str::from_utf8(&(*full_document).as_ref()[self.text.clone()]).unwrap()),
+            title: String::from(full_document.from_utf8_unchecked(self.title.clone())),
+            url: String::from(full_document.from_utf8_unchecked(self.url.clone())),
+            text: String::from(full_document.from_utf8_unchecked(self.text.clone())),
             id: self.id
         }
     }
@@ -115,7 +128,7 @@ impl Default for DocumentRaw {
     }
 }
 
-type BoxedBytes = Box<dyn AsRef<[u8]> + Sync>;
+type BoxedBytes = Box<dyn SomeBytes>;
 
 pub struct SearchResults {
     pub term: String,
@@ -142,14 +155,21 @@ fn open_mmap(full_path: &Path) -> Result<memmap::Mmap, io::Error> {
 }
 
 impl SerializedIndex {
-    pub fn new(file_to_index_path: &str) -> Result<SerializedIndex, io::Error> {
+    pub fn load_from_path(file_to_index_path: &str) -> Result<SerializedIndex, io::Error> {
         let base_path = Path::new(file_to_index_path);
         let inverted_index_path = base_path.with_extension("idx");
         let doc_index_path = base_path.with_extension("dcm");
 
+        println!("trying {:?}", &base_path);
         let file_content = open_mmap(base_path)?;
-        let inverted_index = open_mmap(inverted_index_path.as_path())?;
-        let doc_index = open_mmap(doc_index_path.as_path())?;
+        println!("read base {:?}", base_path);
+
+        println!("trying {:?}", &inverted_index_path);
+        let inverted_index = fs::read(&inverted_index_path)?;
+        println!("read inverted index {:?}", inverted_index_path);
+
+        let doc_index = fs::read(doc_index_path.as_path())?;
+        println!("read doc index {:?}", doc_index_path);
 
         Ok(SerializedIndex {
             inverted_index: Box::new(inverted_index),
@@ -157,16 +177,33 @@ impl SerializedIndex {
             file_contents: Box::new(file_content)
         })
     }
+
+    pub fn write_index_to_path(file_to_index_path: &str, indexer: &dyn DocumentIndexer) -> Result<(), io::Error> {
+        let base_path = Path::new(file_to_index_path);
+        let inverted_index_path = base_path.with_extension("idx.tmp");
+        let doc_index_path = base_path.with_extension("dcm.tmp");
+        {
+            let mut inverted_index = File::create(&inverted_index_path)?;
+            let mut doc_index = File::create(&doc_index_path)?;
+            inverted_index.write_all(&indexer.get_serialized_inverted_index())?;
+            doc_index.write_all(&indexer.get_serialized_documents())?;
+        }
+        fs::rename(&inverted_index_path, inverted_index_path.with_extension("").with_extension("idx"))?;
+        fs::rename(&doc_index_path, doc_index_path.with_extension("").with_extension("dcm"))?;
+        Ok(())
+    }
 }
 
 pub trait DocumentIndexer {
     fn build_from_file_contents(&mut self, file_contents: String);
-
     #[allow(unused_variables)]
     fn build_from_serialized(&mut self, serialized_data: SerializedIndex) {
         panic!("Not implemented");
     }
-    fn get_index(&self) -> Vec<u8> {
+    fn get_serialized_inverted_index(&self) -> Vec<u8> {
+        panic!("Not implemented");
+    }
+    fn get_serialized_documents(&self) -> Vec<u8> {
         panic!("Not implemented");
     }
     fn search(&self, all_terms: Vec<&str>) -> Vec<SearchResults>;
